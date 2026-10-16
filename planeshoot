@@ -1,0 +1,109 @@
+/* Planeshoot - server relay multiplayer (WebSocket, tanpa dependensi).
+   Tugasnya hanya meneruskan pesan antar pemain dalam satu ruangan (maks. 4 pemain).
+   Jalankan:  node server.js           (port default 8080, ubah dengan PORT=3000 node server.js)
+   Opsional:  ALLOWED_ORIGINS="https://www.crazygames.com,https://your-game-host" node server.js */
+const http = require('http'), crypto = require('crypto');
+const PORT = +process.env.PORT || 8080, MAX_PLAYERS = 4, MAX_MSG = 4096, RATE = 60;
+const ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+const rooms = new Map(); let seq = 0;
+
+const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/plain' }); res.end('planeshoot relay ok\n'); });
+
+function frame(op, buf) {
+  const n = buf.length; let h;
+  if (n < 126) h = Buffer.from([0x80 | op, n]);
+  else if (n < 65536) { h = Buffer.alloc(4); h[0] = 0x80 | op; h[1] = 126; h.writeUInt16BE(n, 2); }
+  else { h = Buffer.alloc(10); h[0] = 0x80 | op; h[1] = 127; h.writeBigUInt64BE(BigInt(n), 2); }
+  return Buffer.concat([h, buf]);
+}
+const sendText = (c, obj) => { if (!c.dead) { try { c.sock.write(frame(0x1, Buffer.from(JSON.stringify(obj)))); } catch (e) {} } };
+
+function broadcastPeers(room) {
+  const list = [...room.clients.values()].sort((a, b) => a.order - b.order).map(c => ({ id: c.id, name: c.name, ms: c.ms, order: c.order }));
+  for (const c of room.clients.values()) sendText(c, { t: 'peers', you: c.id, list });
+}
+function drop(c) {
+  if (c.dead) return; c.dead = true;
+  try { c.sock.end(); } catch (e) {} try { c.sock.destroy(); } catch (e) {}
+  const room = rooms.get(c.room); if (!room) return;
+  room.clients.delete(c.id);
+  if (!room.clients.size) rooms.delete(c.room); else broadcastPeers(room);
+}
+function onMessage(c, text) {
+  if (text.length > MAX_MSG) return;
+  const now = Date.now(); if (now - c.win > 1000) { c.win = now; c.count = 0; } if (++c.count > RATE) return;
+  let m; try { m = JSON.parse(text); } catch (e) { return; }
+  if (!m || m.d === undefined) return;
+  const room = rooms.get(c.room); if (!room) return;
+  for (const o of room.clients.values()) if (o !== c) sendText(o, { t: 'm', from: c.id, d: m.d });
+}
+function onData(c, chunk) {
+  c.buf = Buffer.concat([c.buf, chunk]);
+  for (;;) {
+    if (c.buf.length < 2) return;
+    const b0 = c.buf[0], b1 = c.buf[1], op = b0 & 0x0f, masked = !!(b1 & 0x80); let len = b1 & 0x7f, off = 2;
+    if (len === 126) { if (c.buf.length < 4) return; len = c.buf.readUInt16BE(2); off = 4; }
+    else if (len === 127) { if (c.buf.length < 10) return; len = Number(c.buf.readBigUInt64BE(2)); off = 10; }
+    if (len > MAX_MSG * 4 || !masked) return drop(c);
+    if (c.buf.length < off + 4 + len) return;
+    const mask = c.buf.subarray(off, off + 4), payload = Buffer.from(c.buf.subarray(off + 4, off + 4 + len));
+    for (let i = 0; i < len; i++) payload[i] ^= mask[i & 3];
+    c.buf = c.buf.subarray(off + 4 + len);
+    if (op === 0x8) return drop(c);
+    if (op === 0x9) { try { c.sock.write(frame(0xA, payload)); } catch (e) {} }
+    else if (op === 0xA) c.alive = true;
+    else if (op === 0x1) onMessage(c, payload.toString('utf8'));
+  }
+}
+
+server.on('upgrade', (req, sock) => {
+  const url = new URL(req.url, 'http://x'), key = req.headers['sec-websocket-key'], origin = req.headers.origin || '';
+  const code = (url.searchParams.get('room') || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12);
+  if (!key || !code || (ORIGINS.length && origin && !ORIGINS.includes(origin))) { sock.destroy(); return; }
+  const accept = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+  sock.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n');
+  const c = { id: crypto.randomBytes(3).toString('hex'), name: (url.searchParams.get('name') || 'Pilot').slice(0, 12), ms: parseInt(url.searchParams.get('ms') || '0', 10) || 0,
+    order: ++seq, room: code, sock, buf: Buffer.alloc(0), alive: true, dead: false, win: 0, count: 0 };
+  sock.on('data', d => onData(c, d)); sock.on('close', () => drop(c)); sock.on('error', () => drop(c));
+  let room = rooms.get(code); if (!room) { room = { clients: new Map() }; rooms.set(code, room); }
+  if (room.clients.size >= MAX_PLAYERS) { sendText(c, { t: 'full' }); drop(c); return; }
+  room.clients.set(c.id, c); broadcastPeers(room);
+});
+
+setInterval(() => { // ping berkala, buang koneksi yang mati
+  for (const room of rooms.values()) for (const c of [...room.clients.values()]) {
+    if (!c.alive) { drop(c); continue; } c.alive = false;
+    try { c.sock.write(frame(0x9, Buffer.alloc(0))); } catch (e) {}
+  }
+}, 25000);
+
+server.listen(PORT, () => console.log('Planeshoot relay berjalan di port ' + PORT));
+
+node_modules
+.env
+
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json server.js ./
+ENV NODE_ENV=production
+EXPOSE 8080
+CMD ["node", "server.js"]
+
+{
+  "name": "planeshoot-relay",
+  "version": "1.0.0",
+  "description": "Server relay multiplayer Planeshoot (WebSocket, tanpa dependensi)",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=16" },
+  "license": "UNLICENSED",
+  "private": true
+}
+
+services:
+  - type: web
+    name: planeshoot-relay
+    runtime: node
+    plan: free
+    buildCommand: echo "tidak ada dependensi"
+    startCommand: node server.js
